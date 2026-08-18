@@ -1,4 +1,4 @@
-// RCRA Display v1.4.8 — FRAM save blink + no prefix arrows
+// ARC Transmitter v2.1.0 — Custom ESP32 Firmware for 4-DOF Robotic Arm Remote Control (ARC)
 // Changelog:
 // - Removed prefix arrows from status header (now shows only ARMED/UNARMED in color)
 // - Green FRAM indicator now blinks with a black circle for a few seconds after a successful save
