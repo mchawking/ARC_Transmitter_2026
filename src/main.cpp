@@ -73,8 +73,10 @@ bool lastBack=HIGH, lastSelect=HIGH, lastUp=HIGH, lastDown=HIGH, lastToggle=HIGH
 
 // --- FRAM status + save-blink ---
 bool framOK = false;
+bool framProbeOK = false;
 uint32_t lastFramSaveMs = 0;
 const uint16_t FRAM_SAVED_FLASH_MS = 2500;  // blink indicator for ~2.5s after a save
+const uint32_t BOOT_SELECT_TIMEOUT_MS = 5000; // auto-continue if Select is not pressed
 
 // UI screens
 enum UIScreen { UI_MAIN, UI_STATS };
@@ -97,8 +99,9 @@ struct AngleTrack {
 };
 AngleTrack ang[4];
 
-// -------- Per-channel scale & invert --------
-// Shoulder has 4:1 pulley -> joint = encoder/4
+// -------- Fixed pulley compensation and per-channel angle direction --------
+// The shoulder encoder is coupled through a fixed 4:1 pulley; the other
+// encoders measure their joint directly. These are not selectable gear ratios.
 const float CH_SCALE_BASE[4] = { 1.0f/4.0f, 1.0f, 1.0f, 1.0f };
 int8_t CH_SIGN[4] = { +1, +1, +1, +1 }; // stored in FRAM (+1 or -1)
 inline float scaledWithSign(uint8_t ch, float contEncoder) {
@@ -259,13 +262,13 @@ static inline uint16_t hsvToRGB565(float h, float s, float v) {
 // Boot / splash screen shown at startup
 // Shows product name, version info, hardware details, initialization status,
 // and an animated progress bar before transitioning to the main UI.
-void drawBootScreen(bool framOk, bool crsfOk) {
+void drawBootScreen(bool framOk, bool framRwOk, bool crsfOk) {
   tft.fillScreen(ST77XX_BLACK);
   
   // Main title (use smaller font to prevent edge overlap)
   tft.setFont(&FreeSans9pt7b);
   tft.setTextSize(1);
-  const char* title = "Remote Control Robotic Arm";
+  const char* title = "ARC Transmitter";
   int16_t bx, by; uint16_t bw, bh;
   tft.getTextBounds((char*)title, 0, 0, &bx, &by, &bw, &bh);
   int16_t titleX = (tft.width() - bw) / 2;
@@ -282,11 +285,11 @@ void drawBootScreen(bool framOk, bool crsfOk) {
   int16_t infoY = cursorY + bh + 8;
 
   // Primary/alternate strings for width fallback
-  const char* verPrimary = "Firmware v1.4.8";
-  const char* verAlt     = "FW v1.4.8";
-  const char* bldPrimary = "Build: Nov 1, 2025";
-  const char* bldAlt1    = "Build Nov 1, 2025"; // drop colon
-  const char* bldAlt2    = "Nov 1, 2025";       // shortest
+  const char* verPrimary = "Firmware v2.1";
+  const char* verAlt     = "FW v2.1";
+  const char* bldPrimary = "Build: Aug 13, 2026";
+  const char* bldAlt1    = "Build Aug 13, 2026"; // drop colon
+  const char* bldAlt2    = "Aug 13, 2026";       // shortest
 
   // Measure candidates to decide a fit using the current font
   int16_t vbx, vby, sbx, sby, dbx, dby; uint16_t vbw, vbh, sbw, sbh, dbw, dbh;
@@ -406,8 +409,8 @@ void drawBootScreen(bool framOk, bool crsfOk) {
   }
   const char* sensorsLabel = "Sensors: ";
   const char* sensorsState = allSensorsOk ? "OK" : "FAIL";
-  const char* framLabel    = "FRAM: ";
-  const char* framState    = framOk ? "OK" : "FAIL";
+  const char* framLabel    = "FRAM RW: ";
+  const char* framState    = framRwOk ? "PASS" : "FAIL";
   const char* crsfLabel    = "CRSF: ";
   const char* crsfState    = crsfOk ? "OK" : "FAIL";
   const char* sepStatus    = "  "; // two spaces between groups
@@ -439,7 +442,7 @@ void drawBootScreen(bool framOk, bool crsfOk) {
   tft.setCursor(x, statusY - sepBy); tft.print(sepStatus); x += (int16_t)sepW;
 
   tft.setCursor(x, statusY - flBy); tft.print(framLabel); x += (int16_t)flW;
-  tft.setTextColor(framOk ? ST77XX_GREEN : ST77XX_RED);
+  tft.setTextColor(framRwOk ? ST77XX_GREEN : ST77XX_RED);
   tft.setCursor(x, statusY - fsBy); tft.print(framState); x += (int16_t)fsW;
 
   tft.setTextColor(ST77XX_WHITE);
@@ -450,12 +453,13 @@ void drawBootScreen(bool framOk, bool crsfOk) {
   tft.setCursor(x, statusY - csBy); tft.print(crsfState);
 
   // Prompt to proceed
-  const char* prompt = "Press Select to continue";
+  const char* prompt = "Press Select or wait...";
   tft.setTextColor(ST77XX_YELLOW);
   int16_t pBx, pBy; uint16_t pBw, pBh; tft.getTextBounds((char*)prompt, 0, 0, &pBx, &pBy, &pBw, &pBh);
   int16_t promptY = tft.height() - (int16_t)pBh - 6;
   bool prevSel = (digitalRead(BUTTON_SELECT)==LOW);
   uint32_t lastBlink = millis();
+  uint32_t waitStart = millis();
   bool showPrompt = true;
   
   while (true) {
@@ -474,6 +478,7 @@ void drawBootScreen(bool framOk, bool crsfOk) {
     // Wait for a fresh Select press (falling edge)
     bool curSel = (digitalRead(BUTTON_SELECT)==LOW);
     if (curSel && !prevSel) { break; }
+    if (millis() - waitStart >= BOOT_SELECT_TIMEOUT_MS) { break; }
     prevSel = curSel;
     delay(20);
   }
@@ -693,14 +698,14 @@ void drawSensorAngle(uint8_t idx, float degrees) {
 // -------------------- FRAM persistence (v3 baseline) --------------------
 const uint16_t CAL_ADDR_BASE = 0;
 const uint32_t CAL_MAGIC   = 0x41524352UL; // 'R''C''R''A' LE
-const uint16_t CAL_VERSION = 0x0003;       // keep v3 for stability
+const uint16_t CAL_VERSION = 0x0003;       // v3: fixed shoulder pulley compensation
 
 bool framWriteBlock(uint16_t addr, const void* src, uint16_t len) { if (!framOK || !src || !len) return false; fram.write(addr, (uint8_t*)src, len); return true; }
 bool framReadBlock(uint16_t addr, void* dst, uint16_t len) { if (!framOK || !dst || !len) return false; fram.read(addr, (uint8_t*)dst, len); return true; }
 
 bool saveStateToFRAM(){ 
   if(!framOK) return false; 
-  uint8_t rec[106]; 
+  uint8_t rec[106];
   rec[0]=(uint8_t)(CAL_MAGIC&0xFF); rec[1]=(uint8_t)((CAL_MAGIC>>8)&0xFF); rec[2]=(uint8_t)((CAL_MAGIC>>16)&0xFF); rec[3]=(uint8_t)((CAL_MAGIC>>24)&0xFF); 
   rec[4]=(uint8_t)(CAL_VERSION&0xFF); rec[5]=(uint8_t)((CAL_VERSION>>8)&0xFF); 
   uint8_t* p=&rec[6]; 
@@ -724,8 +729,8 @@ bool loadStateFromFRAM(){
   uint32_t magic=(uint32_t)hdr[0]|((uint32_t)hdr[1]<<8)|((uint32_t)hdr[2]<<16)|((uint32_t)hdr[3]<<24); 
   if(magic!=CAL_MAGIC) return false; 
   uint16_t ver=(uint16_t)hdr[4]|((uint16_t)hdr[5]<<8); 
-  if(ver==CAL_VERSION){ 
-    uint8_t rec[106]; 
+  if(ver==CAL_VERSION){
+    uint8_t rec[106];
     if(!framReadBlock(CAL_ADDR_BASE,rec,sizeof(rec))) return false; 
     const uint8_t* p=&rec[6]; 
     auto rd4=[&](){ float f; uint8_t* q=(uint8_t*)&f; for(int i=0;i<4;i++) q[i]=*p++; return f; }; 
@@ -738,6 +743,30 @@ bool loadStateFromFRAM(){
     for(uint8_t ch=0;ch<4;++ch) softMax[ch]=rd4(); 
     return true; 
   } 
+  if(ver==0x0004){ // migrate the temporary ratio format to fixed mechanical scales
+    uint8_t rec[122];
+    if(!framReadBlock(CAL_ADDR_BASE,rec,sizeof(rec))) return false;
+    const uint8_t* p=&rec[6];
+    auto rd4=[&](){ float f; uint8_t* q=(uint8_t*)&f; for(int i=0;i<4;i++) q[i]=*p++; return f; };
+    for(uint8_t ch=0;ch<4;++ch) ang[ch].zeroCont=rd4();
+    for(uint8_t ch=0;ch<4;++ch) ang[ch].lastContScaled=rd4();
+    for(uint8_t ch=0;ch<4;++ch) ang[ch].minDist=rd4();
+    for(uint8_t ch=0;ch<4;++ch) ang[ch].maxDist=rd4();
+    for(uint8_t ch=0;ch<4;++ch) CH_SIGN[ch]=(int8_t)(*p++);
+    for(uint8_t ch=0;ch<4;++ch) softMin[ch]=rd4();
+    for(uint8_t ch=0;ch<4;++ch) softMax[ch]=rd4();
+    float oldScale[4];
+    for(uint8_t ch=0;ch<4;++ch) oldScale[ch]=rd4();
+    for(uint8_t ch=0;ch<4;++ch){
+      if(isfinite(oldScale[ch]) && fabsf(oldScale[ch]) > 1e-6f){
+        float k=CH_SCALE_BASE[ch]/oldScale[ch];
+        ang[ch].zeroCont*=k; ang[ch].lastContScaled*=k;
+        ang[ch].minDist*=k; ang[ch].maxDist*=k;
+        softMin[ch]*=k; softMax[ch]*=k;
+      }
+    }
+    return true;
+  }
   if(ver==0x0002){ 
     uint8_t rec70[70]; 
     if(!framReadBlock(CAL_ADDR_BASE,rec70,sizeof(rec70))) return false; 
@@ -774,9 +803,8 @@ enum CalState { CAL_OFF=0, CAL_INTRO, CAL_MENU, CAL_PICK, CAL_INFO, CAL_CONFIRM,
 CalState calState = CAL_OFF;
 uint8_t  calIdx   = 0; // 0..3
 
-// New: action picker state
-uint8_t  calAction = 0; // 0:Set Zero, 1:Set Min, 2:Set Max
-const char* actionName(uint8_t a){ switch(a){ case 0: return "Set Zero"; case 1: return "Set Min"; default: return "Set Max"; } }
+// Action picker state
+uint8_t  calAction = 0; // 0:Set Zero 1:Set Min 2:Set Max 3:Toggle Dir
 
 const char* chName(uint8_t ch){ switch(ch){ case 0: return "Shoulder"; case 1: return "Upper"; case 2: return "Lower"; default: return "Hand"; } }
 
@@ -968,35 +996,26 @@ void calDrawMenu(uint8_t cursor){
   // Footer removed
 }
 
-// 3-option picker after joint selection
+// 4-option picker: Set Zero, Set Min, Set Max, Toggle Dir
 void calDrawPicker(uint8_t cursor){
-  // Clear bottom area where footer was
   int16_t yFooter = tft.height() - FTR_H;
   tft.fillRect(0, yFooter, tft.width(), FTR_H, ST77XX_BLACK);
-  const uint8_t N=3; 
-  const char* names[N] = {"Set ABS Zero","Set REL Min","Set REL Max"};
-  // Header
+  const uint8_t N=4;
+  const char* names[N] = {"Set ABS Zero","Set REL Min","Set REL Max","Toggle Dir"};
   int16_t bx, by; uint16_t bw, bh;
-  tft.fillRect(0,0,tft.width(),28,ST77XX_BLUE); // Restore/expand banner height for full coverage
-  tft.setFont(&FreeSans9pt7b);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(1);
+  tft.fillRect(0,0,tft.width(),28,ST77XX_BLUE);
+  tft.setFont(&FreeSans9pt7b); tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
   char hdr[40];
   snprintf(hdr, sizeof(hdr), "%s Select Option", chName(calIdx));
   tft.getTextBounds(hdr, 0, 0, &bx, &by, &bw, &bh);
-  int16_t bannerY = (28 - bh) / 2 - by;
-  tft.setCursor(PAD_X, bannerY); tft.print(hdr);
-  // Body (reserve live area above footer)
-  int16_t footerH = FTR_H;
-  int16_t yTop    = HDR_H + 2;
-  int16_t yBottom = tft.height() - footerH;
-  // Remove liveY0 and CAL_LIVE_H box
-  tft.fillRect(0, yTop, tft.width(), (yBottom - yTop), ST77XX_BLACK);
+  tft.setCursor(PAD_X, (28 - bh) / 2 - by); tft.print(hdr);
+  int16_t yTop = HDR_H + 2;
+  int16_t yBottom = tft.height() - FTR_H;
+  tft.fillRect(0, yTop, tft.width(), yBottom - yTop, ST77XX_BLACK);
   tft.setFont(&FreeSans9pt7b); tft.setTextSize(1);
-  tft.getTextBounds((char*)"1. Set Zero", 0, 0, &bx, &by, &bw, &bh);
-  int16_t rowH = bh + 6;
-  int16_t totalH = N * rowH;
-  int16_t startY = yTop + ((yBottom - yTop - totalH) / 2);
+  tft.getTextBounds((char*)"1. Set ABS Zero", 0, 0, &bx, &by, &bw, &bh);
+  int16_t rowH = bh + 4;
+  int16_t startY = yTop + ((yBottom - yTop - N * rowH) / 2);
   for (uint8_t i = 0; i < N; i++) {
     int16_t y = startY + i * rowH;
     if (i == cursor) {
@@ -1006,48 +1025,42 @@ void calDrawPicker(uint8_t cursor){
       tft.fillRect(0, y, tft.width(), rowH, ST77XX_BLACK);
       tft.setTextColor(ST77XX_WHITE);
     }
-    tft.setFont(&FreeSans9pt7b);
-    tft.setTextSize(1);
+    tft.setFont(&FreeSans9pt7b); tft.setTextSize(1);
     int16_t textY = y + rowH / 2 - bh / 2 - by;
-    // Draw left-aligned option text
     tft.setCursor(PAD_X, textY);
     tft.print(i + 1); tft.print(". "); tft.print(names[i]);
-    // Draw right-aligned LS: value
-    char savedVal[16];
-    float val = 0.0f;
-    if(i==0) val = ang[calIdx].zeroCont;
-    else if(i==1) val = softMin[calIdx];
-    else if(i==2) val = softMax[calIdx];
-    if (!isnan(val)) {
-      snprintf(savedVal, sizeof(savedVal), "SAVED: %.1f", val);
+    char savedVal[20];
+    if (i == 0) {
+      float v = ang[calIdx].zeroCont;
+      if (isnan(v)) snprintf(savedVal, sizeof(savedVal), "SAVED: --");
+      else snprintf(savedVal, sizeof(savedVal), "SAVED: %.1f", v);
+    } else if (i == 1) {
+      float v = softMin[calIdx];
+      if (isnan(v)) snprintf(savedVal, sizeof(savedVal), "SAVED: --");
+      else snprintf(savedVal, sizeof(savedVal), "SAVED: %.1f", v);
+    } else if (i == 2) {
+      float v = softMax[calIdx];
+      if (isnan(v)) snprintf(savedVal, sizeof(savedVal), "SAVED: --");
+      else snprintf(savedVal, sizeof(savedVal), "SAVED: %.1f", v);
+    } else if (i == 3) {
+      snprintf(savedVal, sizeof(savedVal), "SAVED: %+d", (int)CH_SIGN[calIdx]);
     } else {
-      snprintf(savedVal, sizeof(savedVal), "SAVED: --");
+      savedVal[0] = '\0';
     }
     int16_t sv_bx, sv_by; uint16_t sv_bw, sv_bh;
     tft.getTextBounds(savedVal, 0, 0, &sv_bx, &sv_by, &sv_bw, &sv_bh);
-    int16_t sv_x = tft.width() - sv_bw - PAD_X;
-    tft.setCursor(sv_x, textY);
+    tft.setCursor(tft.width() - sv_bw - PAD_X, textY);
     tft.print(savedVal);
     tft.setFont(NULL);
   }
-  // Do not draw live angle here; use a dedicated function for live updates
-
-  // Show degrees between REL Min and REL Max at the bottom
-  float minVal = softMin[calIdx];
-  float maxVal = softMax[calIdx];
+  float minVal = softMin[calIdx], maxVal = softMax[calIdx];
   float range = isfinite(minVal) && isfinite(maxVal) ? (maxVal - minVal) : NAN;
   char rangeText[32];
-  if (isnan(range)) {
-    snprintf(rangeText, sizeof(rangeText), "Range: -- degrees");
-  } else {
-    snprintf(rangeText, sizeof(rangeText), "Range: %.1f degrees", range);
-  }
-  tft.setFont(&FreeSans9pt7b);
-  tft.setTextSize(1);
-  yFooter = tft.height() - FTR_H + 4;
-  tft.setCursor(PAD_X, yFooter);
-  tft.setTextColor(ST77XX_CYAN);
-  tft.print(rangeText);
+  if (isnan(range)) snprintf(rangeText, sizeof(rangeText), "Range: -- deg");
+  else snprintf(rangeText, sizeof(rangeText), "Range: %.1f deg", range);
+  tft.setFont(&FreeSans9pt7b); tft.setTextSize(1);
+  tft.setCursor(PAD_X, tft.height() - FTR_H + 4);
+  tft.setTextColor(ST77XX_CYAN); tft.print(rangeText);
   tft.setFont(NULL);
 }
 
@@ -1165,7 +1178,6 @@ void calEnterConfirm(){
   calDrawConfirm(calIdx);
 }
 void calEnterSaved(){ calState=CAL_SAVED; calDrawSaved(); }
-
 void calExitToMain(){
   calState=CAL_OFF; uiScreen=UI_MAIN; 
   tft.fillScreen(ST77XX_BLACK);
@@ -1202,10 +1214,42 @@ void drawMainUIFresh(){
   Wire.beginTransmission(MUX_ADDR); Wire.write(0x00); Wire.endTransmission(); 
 }
 
+bool probeFramReadWrite() {
+  if (!framOK) return false;
+
+  // Probe FRAM at a reserved address away from the calibration record.
+  const uint16_t kProbeAddr = 0x03F0;
+  uint8_t oldByte = 0;
+  uint8_t testByte = 0;
+
+  if (!framReadBlock(kProbeAddr, &oldByte, 1)) return false;
+
+  testByte = (uint8_t)(oldByte ^ 0xA5);
+  if (!framWriteBlock(kProbeAddr, &testByte, 1)) return false;
+
+  uint8_t verify = 0;
+  if (!framReadBlock(kProbeAddr, &verify, 1)) return false;
+
+  // Restore original byte to keep FRAM contents stable.
+  framWriteBlock(kProbeAddr, &oldByte, 1);
+  return verify == testByte;
+}
+
+void printFramStartupDiagnostic(bool stateLoaded, bool crsfReady) {
+  Serial.println("=== FRAM startup diagnostic ===");
+  Serial.printf("FRAM address: 0x%02X\n", FRAM_ADDR);
+  Serial.printf("FRAM init: %s\n", framOK ? "OK" : "FAIL");
+  Serial.printf("FRAM read/write probe: %s\n", framProbeOK ? "PASS" : "FAIL");
+  Serial.printf("FRAM state load: %s\n", stateLoaded ? "OK" : "FAIL");
+  Serial.printf("FRAM verification: %s\n", (framOK && framProbeOK && stateLoaded) ? "PASS" : "FAIL");
+  Serial.printf("CRSF init: %s\n", crsfReady ? "OK" : "FAIL");
+  Serial.println("===============================");
+}
+
 void setup(){
   Serial.begin(115200);
   delay(1000); // Allow Serial to initialize
-  Serial.println("\n=== RCRA Display with CRSF TX ===");
+  Serial.println("\n=== ARC V2.1 Display with CRSF TX ===");
   
   SPI.begin(TFT_SCLK,-1,TFT_MOSI,TFT_CS);
   tft.init(170,320); tft.setRotation(1); tft.setTextWrap(false); tft.fillScreen(ST77XX_BLACK);
@@ -1216,12 +1260,15 @@ void setup(){
 
   // Initialize CRSF early so the boot screen can report its status
   crsf = new CrsfSerial(Serial1, CRSF_RX_PIN, CRSF_TX_PIN, true);
-  crsf->begin(400000);
+  crsf->begin(420000);
+
+  framProbeOK = probeFramReadWrite();
 
   // Show boot/splash screen (5s) that reports FRAM and CRSF status
-  drawBootScreen(framOK, crsf->isInitialized());
+  drawBootScreen(framOK, framProbeOK, crsf->isInitialized());
 
   bool loaded=framOK && loadStateFromFRAM();
+  printFramStartupDiagnostic(loaded, crsf->isInitialized());
   for(uint8_t ch=0; ch<4; ++ch){ 
     float deg0to360; 
     if(readAngleDeg(ch,deg0to360)){ 
@@ -1267,35 +1314,47 @@ void loop(){
         break;
 
       case CAL_PICK:
-        if(eUp && bUp){ calAction = (uint8_t)((int)calAction + 2) % 3; calDrawPicker(calAction);} // wrap -1
-        if(eDown && bDown){ calAction = (uint8_t)((int)calAction + 1) % 3; calDrawPicker(calAction);} // wrap +1
+        if(eUp && bUp){ calAction = (uint8_t)((int)calAction + 3) % 4; calDrawPicker(calAction);} // wrap -1
+        if(eDown && bDown){ calAction = (uint8_t)((int)calAction + 1) % 4; calDrawPicker(calAction);} // wrap +1
         if (calBlockSelectUntilRelease) { if(!bSelect) calBlockSelectUntilRelease=false; }
         else { if(eSel && bSelect){
-            // Perform selected action immediately
-            // 0:Set Zero, 1:Set Min, 2:Set Max
-            float deg0to360;
-            if(readAngleDeg(calIdx,deg0to360)){
-              float contEnc=unwrapAngle(calIdx,deg0to360);
-              float contScaled=scaledWithSign(calIdx,contEnc);
-              float dist = contScaled - ang[calIdx].zeroCont;
-              if(calAction==0){
-                // Set Zero: new baseline at current position; reset ranges
-                ang[calIdx].zeroCont = contScaled;
-                ang[calIdx].minDist = 0; ang[calIdx].maxDist = 0;
-                softMin[calIdx] = 0; softMax[calIdx] = 0;
-                ang[calIdx].lastContScaled = contScaled;
-              } else if(calAction==1){
-                // Set Min: store current distance-from-zero as min
-                softMin[calIdx] = dist;
-              } else {
-                // Set Max: store current distance-from-zero as max
-                softMax[calIdx] = dist;
-              }
+            if (calAction == 3) {
+              // Toggle direction and preserve calibration by mirroring values.
+              CH_SIGN[calIdx] = (int8_t)(-CH_SIGN[calIdx]);
+              ang[calIdx].zeroCont = -ang[calIdx].zeroCont;
+              ang[calIdx].lastContScaled = -ang[calIdx].lastContScaled;
+              float oldMinDist = ang[calIdx].minDist;
+              float oldMaxDist = ang[calIdx].maxDist;
+              ang[calIdx].minDist = -oldMaxDist;
+              ang[calIdx].maxDist = -oldMinDist;
+              float oldSoftMin = softMin[calIdx];
+              float oldSoftMax = softMax[calIdx];
+              softMin[calIdx] = -oldSoftMax;
+              softMax[calIdx] = -oldSoftMin;
               saveStateToFRAM();
+              Wire.beginTransmission(MUX_ADDR); Wire.write(0x00); Wire.endTransmission();
+              calEnterSaved();
+            } else {
+              float deg0to360;
+              if(readAngleDeg(calIdx,deg0to360)){
+                float contEnc=unwrapAngle(calIdx,deg0to360);
+                float contScaled=scaledWithSign(calIdx,contEnc);
+                float dist = contScaled - ang[calIdx].zeroCont;
+                if(calAction==0){
+                  ang[calIdx].zeroCont=contScaled;
+                  ang[calIdx].minDist=0; ang[calIdx].maxDist=0;
+                  softMin[calIdx]=0; softMax[calIdx]=0;
+                  ang[calIdx].lastContScaled=contScaled;
+                } else if(calAction==1){
+                  softMin[calIdx]=dist;
+                } else {
+                  softMax[calIdx]=dist;
+                }
+                saveStateToFRAM();
+              }
+              Wire.beginTransmission(MUX_ADDR); Wire.write(0x00); Wire.endTransmission();
+              calEnterSaved();
             }
-            // Return MUX idle
-            Wire.beginTransmission(MUX_ADDR); Wire.write(0x00); Wire.endTransmission();
-            calEnterSaved();
           } }
         if(eBack && bBack){ calEnterMenu(calIdx); }
 

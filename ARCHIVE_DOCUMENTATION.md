@@ -1,19 +1,19 @@
-# RCRA Project Archive Documentation
+# ARC Project Archive Documentation
 
-**Date:** November 20, 2025  
+**Date:** August 9, 2026  
 **Maintained by:** Todd (toddimus-prime)
 
 ---
 
 ## Active Projects
 
-### ✅ RCRA V1.1 - Oct 25 (PRIMARY)
-**Status:** ACTIVE - Current production code  
-**Location:** `c:\Users\manea\OneDrive\Documents\PlatformIO\Projects\RCRA V1.1 - Oct 25`  
-**GitHub:** https://github.com/toddimus-prime/RCRA---Armageddon-Arm-Control-Rig-Code-with-Display
+### ✅ ARC V2.1 - Aug 26 (WORKING COPY)
+**Status:** ACTIVE - New development branch based on RCRA V1.1  
+**Location:** `c:\Users\manea\OneDrive\Documents\PlatformIO\Projects\ARC V2.1 - Aug 26`  
+**Source:** `c:\Users\manea\OneDrive\Documents\PlatformIO\Projects\RCRA V1.1 - Oct 25`
 
 **Description:**  
-Complete RCRA Display and Control System with:
+Development copy of the RCRA display and control system for ARC tuning and iteration:
 - ST7789 TFT Display (320x170)
 - 4x AS5600 Encoder support via I2C multiplexer
 - CRSF Protocol for ELRS/ExpressLRS transmission
@@ -83,9 +83,35 @@ To avoid accidentally uploading archived code:
 
 ## Project Maintenance
 
-**Current Version:** v1.4.8  
-**Last Updated:** November 20, 2025  
+**Current Version:** v2.1.0-dev  
+**Last Updated:** August 9, 2026  
 **Platform:** PlatformIO + Arduino ESP32  
 **Framework:** Arduino
 
 For questions or issues, refer to the main RCRA V1.1 - Oct 25 project.
+
+---
+
+## Milestone Log
+
+### 2026-08-09 - USB/rig diagnosis complete + calibration preservation fix
+
+**Status:** Milestone reached, field validation pending
+
+**Completed today:**
+1. Confirmed upload path works on bench hardware (COM7) after driver and boot-mode recovery.
+2. Confirmed both ESP32 boards are healthy and flashable.
+3. Isolated failure mode to rig integration conditions, not firmware image integrity.
+4. Implemented bug fix in calibration flow so changing direction or gear ratio no longer zeroes stored values.
+   - Direction toggle now mirrors stored calibration values.
+   - Gear ratio change now rescales stored calibration values using newScale/oldScale.
+5. Verified ARC project builds successfully after patch (PlatformIO build exit code 0).
+
+**Observed hardware behavior:**
+- In-rig USB detection is intermittent unless BOOT is held during attach in some cases.
+- Symptom pattern strongly suggests rig-side power and/or pin-loading interference during enumeration/programming.
+
+**Next step for tomorrow morning:**
+1. Upload patched ARC build to in-rig board.
+2. Validate that changing direction and gear ratio preserves the first three saved values.
+3. If needed, continue rig-side power and pin isolation tests.
