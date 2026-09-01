@@ -77,7 +77,7 @@ The firmware uses 420000 baud and transmits CRSF frames at approximately 250 Hz.
 | 3 | Lower AS5600 position, mapped from calibrated range to 1000-2000 us. |
 | 4 | Hand AS5600 position, mapped from calibrated range to 1000-2000 us. |
 | 5 | Arm toggle: 2000 us armed, 1000 us unarmed. |
-| 6 | Fixed low: 1000 us. |
+| 6 | Hold Select on calibration menu `Rx Calibration`: sends 2000 us while unarmed; releasing Select or arming sends 1000 us. |
 | 7-16 | Neutral / centered. |
 
 ## Not Defined by Current Firmware
