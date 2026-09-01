@@ -26,7 +26,7 @@
 #define CRSF_TX_PIN  20
 
 // --- Inputs ---
-#define BUTTON_BACK   18  // Back — 5s zero-all (MAIN) / Exit menus
+#define BUTTON_BACK   18  // Back — exit menus
 #define BUTTON_SELECT 19  // Select — 2s opens Calibration Menu / selects item / confirm
 #define BUTTON_UP     13  // Up — navigate up
 #define BUTTON_DOWN   14  // Down — navigate down
@@ -46,6 +46,7 @@ Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 Adafruit_FRAM_I2C fram;
 // CRSF transmitter instance (created in setup)
 CrsfSerial* crsf = nullptr;
+bool startupArmInterlock = false;
 
 // --- Layout for 320x170, rotation=1 ---
 const int16_t PAD_X    = 8;
@@ -74,6 +75,9 @@ bool lastBack=HIGH, lastSelect=HIGH, lastUp=HIGH, lastDown=HIGH, lastToggle=HIGH
 // --- FRAM status + save-blink ---
 bool framOK = false;
 bool framProbeOK = false;
+bool startupStateLoaded = false;
+bool startupInitializationComplete = false;
+uint8_t startupInitializationStage = 0;
 uint32_t lastFramSaveMs = 0;
 const uint16_t FRAM_SAVED_FLASH_MS = 2500;  // blink indicator for ~2.5s after a save
 const uint32_t BOOT_SELECT_TIMEOUT_MS = 5000; // auto-continue if Select is not pressed
@@ -262,7 +266,9 @@ static inline uint16_t hsvToRGB565(float h, float s, float v) {
 // Boot / splash screen shown at startup
 // Shows product name, version info, hardware details, initialization status,
 // and an animated progress bar before transitioning to the main UI.
-void drawBootScreen(bool framOk, bool framRwOk, bool crsfOk) {
+void serviceStartupInitialization();
+
+void drawBootScreen() {
   tft.fillScreen(ST77XX_BLACK);
   
   // Main title (use smaller font to prevent edge overlap)
@@ -379,6 +385,7 @@ void drawBootScreen(bool framOk, bool framRwOk, bool crsfOk) {
   const uint32_t totalMs = 5000;
   
   while (millis() - start < totalMs) {
+    serviceStartupInitialization();
     uint32_t now = millis();
     float frac = (float)(now - start) / (float)totalMs;
     if (frac < 0) frac = 0; if (frac > 1) frac = 1;
@@ -393,7 +400,13 @@ void drawBootScreen(bool framOk, bool framRwOk, bool crsfOk) {
       tft.fillRoundRect(pbX + 2, pbY + 2, fillW, pbH - 4, 3, col);
     }
     
+    if (crsf != nullptr) crsf->update();
     delay(50);
+  }
+
+  while (!startupInitializationComplete) {
+    serviceStartupInitialization();
+    if (crsf != nullptr) crsf->update();
   }
 
   // System status on a single centered line: "Sensors: OK  FRAM: OK  CRSF: OK"
@@ -410,8 +423,9 @@ void drawBootScreen(bool framOk, bool framRwOk, bool crsfOk) {
   const char* sensorsLabel = "Sensors: ";
   const char* sensorsState = allSensorsOk ? "OK" : "FAIL";
   const char* framLabel    = "FRAM RW: ";
-  const char* framState    = framRwOk ? "PASS" : "FAIL";
+  const char* framState    = framProbeOK ? "PASS" : "FAIL";
   const char* crsfLabel    = "CRSF: ";
+  const bool crsfOk = crsf != nullptr && crsf->isInitialized();
   const char* crsfState    = crsfOk ? "OK" : "FAIL";
   const char* sepStatus    = "  "; // two spaces between groups
 
@@ -442,7 +456,7 @@ void drawBootScreen(bool framOk, bool framRwOk, bool crsfOk) {
   tft.setCursor(x, statusY - sepBy); tft.print(sepStatus); x += (int16_t)sepW;
 
   tft.setCursor(x, statusY - flBy); tft.print(framLabel); x += (int16_t)flW;
-  tft.setTextColor(framRwOk ? ST77XX_GREEN : ST77XX_RED);
+  tft.setTextColor(framProbeOK ? ST77XX_GREEN : ST77XX_RED);
   tft.setCursor(x, statusY - fsBy); tft.print(framState); x += (int16_t)fsW;
 
   tft.setTextColor(ST77XX_WHITE);
@@ -480,10 +494,36 @@ void drawBootScreen(bool framOk, bool framRwOk, bool crsfOk) {
     if (curSel && !prevSel) { break; }
     if (millis() - waitStart >= BOOT_SELECT_TIMEOUT_MS) { break; }
     prevSel = curSel;
+    if (crsf != nullptr) crsf->update();
     delay(20);
   }
 
   // Clear the whole screen so no splash remnants remain when main UI draws
+  tft.fillScreen(ST77XX_BLACK);
+}
+
+void showStartupArmWarning() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.fillRect(0, 0, tft.width(), 28, ST77XX_RED);
+  tft.setFont(&FreeSans9pt7b);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
+  tft.setCursor(PAD_X, 19); tft.print("ARM SWITCH ON");
+  int16_t bx, by; uint16_t bw, bh;
+  tft.getTextBounds((char*)"TURN SWITCH OFF", 0, 0, &bx, &by, &bw, &bh);
+  tft.setCursor((tft.width() - bw) / 2, 72 - by); tft.print("TURN SWITCH OFF");
+  tft.getTextBounds((char*)"TO ENABLE ARMING", 0, 0, &bx, &by, &bw, &bh);
+  tft.setCursor((tft.width() - bw) / 2, 104 - by); tft.print("TO ENABLE ARMING");
+  tft.setFont(NULL);
+
+  while (digitalRead(TOGGLE_PIN) == LOW) {
+    if (crsf != nullptr) {
+      crsf->setChannelUs(5, 1000);
+      crsf->setChannelUs(6, 1000);
+      crsf->update();
+    }
+    delay(4);
+  }
+  startupArmInterlock = false;
   tft.fillScreen(ST77XX_BLACK);
 }
 void drawStatus(bool armedLow) {
@@ -802,6 +842,9 @@ bool     calBlockSelectUntilRelease = false; // require Select to be released on
 enum CalState { CAL_OFF=0, CAL_INTRO, CAL_MENU, CAL_PICK, CAL_INFO, CAL_CONFIRM, CAL_SAVED };
 CalState calState = CAL_OFF;
 uint8_t  calIdx   = 0; // 0..3
+uint8_t  calIntroIdx = 0; // 0..1; Rx Calibration plus joint calibration menu
+uint8_t  calMenuIdx = 0; // 0..3; joint calibration entries
+bool     ch6OutputHigh = false;
 
 // Action picker state
 uint8_t  calAction = 0; // 0:Set Zero 1:Set Min 2:Set Max 3:Toggle Dir
@@ -960,7 +1003,7 @@ void calDrawMenu(uint8_t cursor){
   // Clear bottom area where footer was
   int16_t yFooter = tft.height() - FTR_H;
   tft.fillRect(0, yFooter, tft.width(), FTR_H, ST77XX_BLACK);
-  const uint8_t N=4; 
+  const uint8_t N=4;
   const char* names[N] = {"Shoulder","Upper","Lower","Hand"};
   // Header
   tft.fillRect(0,0,tft.width(),28,ST77XX_BLUE); // Restore/expand banner height for full coverage
@@ -1064,6 +1107,52 @@ void calDrawPicker(uint8_t cursor){
   tft.setFont(NULL);
 }
 
+void calDrawIntroMenu() {
+  const char* names[2] = {"Rx Calibration", "Joint Calibration"};
+  tft.fillScreen(ST77XX_BLACK);
+  tft.fillRect(0, 0, tft.width(), 28, ST77XX_BLUE);
+  tft.setFont(&FreeSans9pt7b);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
+  tft.setCursor(PAD_X, 19); tft.print("Calibration");
+  int16_t bx, by; uint16_t bw, bh;
+  tft.getTextBounds((char*)"Rx Calibration", 0, 0, &bx, &by, &bw, &bh);
+  int16_t rowH = bh + 10;
+  int16_t startY = 52;
+  for (uint8_t i = 0; i < 2; ++i) {
+    int16_t y = startY + i * rowH;
+    if (i == calIntroIdx) {
+      tft.fillRect(0, y, tft.width(), rowH, ST77XX_BLUE);
+      tft.setTextColor(ST77XX_YELLOW);
+    } else {
+      tft.setTextColor(ST77XX_WHITE);
+    }
+    tft.setCursor(PAD_X, y + rowH / 2 - bh / 2 - by);
+    tft.print(i + 1); tft.print(". "); tft.print(names[i]);
+  }
+  tft.setFont(NULL);
+}
+
+void calDrawSendingCh6High() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.fillRect(0, 0, tft.width(), 28, ST77XX_BLUE);
+  tft.setFont(&FreeSans9pt7b);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1);
+  tft.setCursor(PAD_X, 19); tft.print("Rx Calibration");
+  int16_t bx, by; uint16_t bw, bh;
+  tft.getTextBounds((char*)"SENDING CH6 HIGH", 0, 0, &bx, &by, &bw, &bh);
+  const int16_t boxPadding = 14;
+  int16_t boxX = (tft.width() - bw) / 2 - boxPadding;
+  int16_t boxY = (tft.height() - bh) / 2 - boxPadding;
+  int16_t boxW = bw + 2 * boxPadding;
+  int16_t boxH = bh + 2 * boxPadding;
+  tft.fillRect(boxX, boxY, boxW, boxH, ST77XX_RED);
+  tft.drawRect(boxX, boxY, boxW, boxH, ST77XX_WHITE);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor((tft.width() - bw) / 2, boxY + (boxH - bh) / 2 - by);
+  tft.print("SENDING CH6 HIGH");
+  tft.setFont(NULL);
+}
+
 // INFO screen (existing)
 // Calibration info screen
 void calDrawIntroInfo() {
@@ -1147,15 +1236,16 @@ void calDrawSaved(){
 // Entry helpers
 void calEnterIntro(){
   calState = CAL_INTRO;
+  calIntroIdx = 0;
   calInputStallUntil = millis() + 200;
   calBlockSelectUntilRelease = (digitalRead(BUTTON_SELECT)==LOW);
-  calDrawIntroInfo();
+  calDrawIntroMenu();
 }
 void calEnterMenu(uint8_t preselect=0){
-  calState=CAL_MENU; calIdx=preselect; 
+  calState=CAL_MENU; calMenuIdx=preselect;
   calInputStallUntil = millis() + 200; 
   calBlockSelectUntilRelease = (digitalRead(BUTTON_SELECT)==LOW);
-  calDrawMenu(calIdx);
+  calDrawMenu(calMenuIdx);
 }
 void calEnterPicker(uint8_t idx){
   calState=CAL_PICK; calIdx=idx; calAction=0;
@@ -1184,6 +1274,13 @@ void calExitToMain(){
   SENSOR_BLOCK_Y=tft.height()-SENSOR_BLOCK_H; 
   drawStatus(digitalRead(TOGGLE_PIN)==LOW); /* redrawArrowIconsNow(); */ drawSensorBlockFrame();
   needsMainRedraw=false; 
+}
+
+void updateCrsfMenuChannels(bool armed) {
+  if (crsf == nullptr) return;
+  crsf->setChannelUs(5, (armed && !startupArmInterlock) ? 2000 : 1000);
+  crsf->setChannelUs(6, (!armed && ch6OutputHigh) ? 2000 : 1000);
+  crsf->update();
 }
 
 // -------------------- Setup / Loop --------------------
@@ -1246,6 +1343,33 @@ void printFramStartupDiagnostic(bool stateLoaded, bool crsfReady) {
   Serial.println("===============================");
 }
 
+void serviceStartupInitialization() {
+  if (startupInitializationComplete) return;
+
+  if (startupInitializationStage == 0) {
+    framOK = fram.begin(FRAM_ADDR, &Wire);
+  } else if (startupInitializationStage == 1) {
+    framProbeOK = probeFramReadWrite();
+  } else if (startupInitializationStage == 2) {
+    startupStateLoaded = framOK && loadStateFromFRAM();
+  } else if (startupInitializationStage >= 3 && startupInitializationStage <= 6) {
+    uint8_t ch = startupInitializationStage - 3;
+    float deg0to360;
+    if (readAngleDeg(ch, deg0to360)) {
+      if (startupStateLoaded) seedUnwrapFromScaled(ch, deg0to360, ang[ch].lastContScaled);
+      else {
+        unwrapAngle(ch, deg0to360);
+        ang[ch].lastContScaled = scaledWithSign(ch, deg0to360);
+      }
+    }
+  } else {
+    Wire.beginTransmission(MUX_ADDR); Wire.write(0x00); Wire.endTransmission();
+    printFramStartupDiagnostic(startupStateLoaded, crsf != nullptr && crsf->isInitialized());
+    startupInitializationComplete = true;
+  }
+  ++startupInitializationStage;
+}
+
 void setup(){
   Serial.begin(115200);
   delay(1000); // Allow Serial to initialize
@@ -1256,27 +1380,19 @@ void setup(){
   SENSOR_BLOCK_Y=tft.height()-SENSOR_BLOCK_H;
   pinMode(BUTTON_BACK,INPUT_PULLUP); pinMode(BUTTON_SELECT,INPUT_PULLUP); pinMode(BUTTON_UP,INPUT_PULLUP); pinMode(BUTTON_DOWN,INPUT_PULLUP); pinMode(TOGGLE_PIN,INPUT_PULLUP);
   lastBack=digitalRead(BUTTON_BACK); lastSelect=digitalRead(BUTTON_SELECT); lastUp=digitalRead(BUTTON_UP); lastDown=digitalRead(BUTTON_DOWN); lastToggle=digitalRead(TOGGLE_PIN);
-  Wire.begin(I2C_SDA,I2C_SCL); framOK=fram.begin(FRAM_ADDR,&Wire);
+  Wire.begin(I2C_SDA,I2C_SCL);
 
   // Initialize CRSF early so the boot screen can report its status
   crsf = new CrsfSerial(Serial1, CRSF_RX_PIN, CRSF_TX_PIN, true);
   crsf->begin(420000);
+  startupArmInterlock = (lastToggle == LOW);
+  crsf->setChannelUs(5, 1000);
+  crsf->setChannelUs(6, 1000);
+  crsf->sendChannels();
 
-  framProbeOK = probeFramReadWrite();
-
-  // Show boot/splash screen (5s) that reports FRAM and CRSF status
-  drawBootScreen(framOK, framProbeOK, crsf->isInitialized());
-
-  bool loaded=framOK && loadStateFromFRAM();
-  printFramStartupDiagnostic(loaded, crsf->isInitialized());
-  for(uint8_t ch=0; ch<4; ++ch){ 
-    float deg0to360; 
-    if(readAngleDeg(ch,deg0to360)){ 
-      if(loaded) seedUnwrapFromScaled(ch,deg0to360,ang[ch].lastContScaled); 
-      else { unwrapAngle(ch,deg0to360); ang[ch].lastContScaled=scaledWithSign(ch,deg0to360);} 
-    } 
-  }
-  Wire.beginTransmission(MUX_ADDR); Wire.write(0x00); Wire.endTransmission();
+  // The splash is visible while FRAM and sensor initialization runs in stages.
+  drawBootScreen();
+  if (startupArmInterlock) showStartupArmWarning();
   drawStatus(lastToggle==LOW); redrawArrowIconsNow(); drawSensorBlockFrame();
 }
 
@@ -1286,6 +1402,11 @@ void loop(){
   bool bUp=(digitalRead(BUTTON_UP)==LOW);
   bool bDown=(digitalRead(BUTTON_DOWN)==LOW);
   bool bToggle=(digitalRead(TOGGLE_PIN)==LOW);
+
+  if (bToggle && ch6OutputHigh) {
+    ch6OutputHigh = false;
+    if (calState == CAL_INTRO && calIntroIdx == 0) calDrawIntroMenu();
+  }
 
   
 
@@ -1300,16 +1421,33 @@ void loop(){
 
     switch(calState){
       case CAL_INTRO:
+        {
+          bool sendCh6High = !bToggle && !calBlockSelectUntilRelease && calIntroIdx == 0 && bSelect;
+          if (sendCh6High != ch6OutputHigh) {
+            ch6OutputHigh = sendCh6High;
+            if (ch6OutputHigh) calDrawSendingCh6High();
+            else calDrawIntroMenu();
+          }
+          if (sendCh6High) break;
+        }
+        if(eUp && bUp){ calIntroIdx = 1 - calIntroIdx; calDrawIntroMenu(); }
+        if(eDown && bDown){ calIntroIdx = 1 - calIntroIdx; calDrawIntroMenu(); }
         if (calBlockSelectUntilRelease) { if(!bSelect) calBlockSelectUntilRelease=false; }
-        else { if(eSel && bSelect){ calEnterMenu(0); } }
+        else if(eSel && bSelect){
+          if (calIntroIdx == 1) {
+            calEnterMenu(0);
+          }
+        }
         if(eBack && bBack){ calExitToMain(); }
         break;
 
       case CAL_MENU:
-        if(eUp && bUp){ calIdx=wrapIndex(calIdx-1); calDrawMenu(calIdx);} 
-        if(eDown && bDown){ calIdx=wrapIndex(calIdx+1); calDrawMenu(calIdx);} 
+        if(eUp && bUp){ calMenuIdx=wrapIndex(calMenuIdx-1); calDrawMenu(calMenuIdx);}
+        if(eDown && bDown){ calMenuIdx=wrapIndex(calMenuIdx+1); calDrawMenu(calMenuIdx);}
         if (calBlockSelectUntilRelease) { if(!bSelect) calBlockSelectUntilRelease=false; }
-        else { if(eSel && bSelect){ calEnterPicker(calIdx);} }
+        else if(eSel && bSelect){
+          calEnterPicker(calMenuIdx);
+        }
         if(eBack && bBack){ calExitToMain(); }
         break;
 
@@ -1412,6 +1550,7 @@ void loop(){
 
       default: break;
     }
+    updateCrsfMenuChannels(bToggle);
     return; // block other UI while in menus
   }
 
@@ -1528,10 +1667,10 @@ void loop(){
     }
     // Channel 5: Power/Arm switch (explicit high/low in microseconds)
     // Arming toggle is INPUT_PULLUP, active-low when ARMED
-    crsf->setChannelUs(5, bToggle ? 2000 : 1000);
+    crsf->setChannelUs(5, (bToggle && !startupArmInterlock) ? 2000 : 1000);
 
-    // Channel 6 fixed low at 1000us at all times
-    crsf->setChannelUs(6, 1000);
+    // Channel 6 is selected from the Rx Calibration menu item and is never high while armed.
+    crsf->setChannelUs(6, (!bToggle && ch6OutputHigh) ? 2000 : 1000);
     // Keep channels 7-16 neutral (center)
     for (uint8_t i = 7; i <= 16; i++) {
       crsf->setChannelFloat(i, 0.0f);
