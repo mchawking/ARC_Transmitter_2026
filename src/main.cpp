@@ -1,5 +1,6 @@
-// ARC Transmitter v2.1.0 — Custom ESP32 Firmware for 4-DOF Robotic Arm Remote Control (ARC)
+// ARC Transmitter v2.2.0 — Custom ESP32 Firmware for 4-DOF Robotic Arm Remote Control (ARC)
 // Changelog:
+// - v2.2.0: Added safe Rx calibration (CH6) menu and startup arm-switch interlock
 // - Removed prefix arrows from status header (now shows only ARMED/UNARMED in color)
 // - Green FRAM indicator now blinks with a black circle for a few seconds after a successful save
 // - Keeps v1.4.7 features: 3-option calibration picker with live Abs & Δ-from-zero (~20 Hz), SAVED splash, FRAM v3 persistence
@@ -291,11 +292,11 @@ void drawBootScreen() {
   int16_t infoY = cursorY + bh + 8;
 
   // Primary/alternate strings for width fallback
-  const char* verPrimary = "Firmware v2.1";
-  const char* verAlt     = "FW v2.1";
-  const char* bldPrimary = "Build: Aug 13, 2026";
-  const char* bldAlt1    = "Build Aug 13, 2026"; // drop colon
-  const char* bldAlt2    = "Aug 13, 2026";       // shortest
+  const char* verPrimary = "Firmware v2.2";
+  const char* verAlt     = "FW v2.2";
+  const char* bldPrimary = "Build: Oct 6, 2026";
+  const char* bldAlt1    = "Build Oct 6, 2026"; // drop colon
+  const char* bldAlt2    = "Oct 6, 2026";       // shortest
 
   // Measure candidates to decide a fit using the current font
   int16_t vbx, vby, sbx, sby, dbx, dby; uint16_t vbw, vbh, sbw, sbh, dbw, dbh;
@@ -409,7 +410,7 @@ void drawBootScreen() {
     if (crsf != nullptr) crsf->update();
   }
 
-  // System status on a single centered line: "Sensors: OK  FRAM: OK  CRSF: OK"
+  // System status on two centered lines: "Sensors: OK  FRAM: OK" then "CRSF: OK" below
   int16_t statusY = pbY + pbH + 12;
   tft.setFont(&FreeSans9pt7b);
   tft.setTextSize(1);
@@ -423,7 +424,7 @@ void drawBootScreen() {
   const char* sensorsLabel = "Sensors: ";
   const char* sensorsState = allSensorsOk ? "OK" : "FAIL";
   const char* framLabel    = "FRAM RW: ";
-  const char* framState    = framProbeOK ? "PASS" : "FAIL";
+  const char* framState    = framProbeOK ? "OK" : "FAIL";
   const char* crsfLabel    = "CRSF: ";
   const bool crsfOk = crsf != nullptr && crsf->isInitialized();
   const char* crsfState    = crsfOk ? "OK" : "FAIL";
@@ -442,11 +443,11 @@ void drawBootScreen() {
   tft.getTextBounds((char*)crsfLabel,    0, 0, &tbx, &clBy, &clW, &tbh);
   tft.getTextBounds((char*)crsfState,    0, 0, &tbx, &csBy, &csW, &tbh);
 
-  uint16_t totalW = slW + ssW + sepW + flW + fsW + sepW + clW + csW;
-  int16_t x = (tft.width() - (int16_t)totalW) / 2;
+  // Row 1: "Sensors: OK  FRAM RW: OK"
+  uint16_t totalW1 = slW + ssW + sepW + flW + fsW;
+  int16_t x = (tft.width() - (int16_t)totalW1) / 2;
   if (x < PAD_X) x = PAD_X;
 
-  // Draw the composite line with colored states
   tft.setTextColor(ST77XX_WHITE);
   tft.setCursor(x, statusY - slBy); tft.print(sensorsLabel); x += (int16_t)slW;
   tft.setTextColor(allSensorsOk ? ST77XX_GREEN : ST77XX_RED);
@@ -457,39 +458,25 @@ void drawBootScreen() {
 
   tft.setCursor(x, statusY - flBy); tft.print(framLabel); x += (int16_t)flW;
   tft.setTextColor(framProbeOK ? ST77XX_GREEN : ST77XX_RED);
-  tft.setCursor(x, statusY - fsBy); tft.print(framState); x += (int16_t)fsW;
+  tft.setCursor(x, statusY - fsBy); tft.print(framState);
+
+  // Row 2 (where the old blinking prompt used to be): "CRSF: OK", centered on its own
+  int16_t rowH = (int16_t)tbh + 10;
+  int16_t statusY2 = statusY + rowH;
+  uint16_t totalW2 = clW + csW;
+  int16_t x2 = (tft.width() - (int16_t)totalW2) / 2;
+  if (x2 < PAD_X) x2 = PAD_X;
 
   tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(x, statusY - sepBy); tft.print(sepStatus); x += (int16_t)sepW;
-
-  tft.setCursor(x, statusY - clBy); tft.print(crsfLabel); x += (int16_t)clW;
+  tft.setCursor(x2, statusY2 - clBy); tft.print(crsfLabel); x2 += (int16_t)clW;
   tft.setTextColor(crsfOk ? ST77XX_GREEN : ST77XX_RED);
-  tft.setCursor(x, statusY - csBy); tft.print(crsfState);
+  tft.setCursor(x2, statusY2 - csBy); tft.print(crsfState);
 
-  // Prompt to proceed
-  const char* prompt = "Press Select or wait...";
-  tft.setTextColor(ST77XX_YELLOW);
-  int16_t pBx, pBy; uint16_t pBw, pBh; tft.getTextBounds((char*)prompt, 0, 0, &pBx, &pBy, &pBw, &pBh);
-  int16_t promptY = tft.height() - (int16_t)pBh - 6;
+  // Wait for a fresh Select press (falling edge) or timeout before continuing to the main UI.
+  // No on-screen prompt is drawn here so it cannot overlap the status rows above.
   bool prevSel = (digitalRead(BUTTON_SELECT)==LOW);
-  uint32_t lastBlink = millis();
   uint32_t waitStart = millis();
-  bool showPrompt = true;
-  
   while (true) {
-    // Blink the prompt
-    if (millis() - lastBlink > 400) {
-      lastBlink = millis();
-      showPrompt = !showPrompt;
-      // Clear prompt area
-      tft.fillRect(0, promptY + pBy - 2, tft.width(), pBh + 6, ST77XX_BLACK);
-      if (showPrompt) {
-        tft.setTextColor(ST77XX_YELLOW);
-        tft.setCursor((tft.width() - (int16_t)pBw) / 2, promptY - pBy);
-        tft.print(prompt);
-      }
-    }
-    // Wait for a fresh Select press (falling edge)
     bool curSel = (digitalRead(BUTTON_SELECT)==LOW);
     if (curSel && !prevSel) { break; }
     if (millis() - waitStart >= BOOT_SELECT_TIMEOUT_MS) { break; }
@@ -1393,6 +1380,10 @@ void setup(){
   // The splash is visible while FRAM and sensor initialization runs in stages.
   drawBootScreen();
   if (startupArmInterlock) showStartupArmWarning();
+  // Re-read the toggle here: showStartupArmWarning() blocks until the switch is
+  // flipped off, so the pre-wait reading above is stale and would otherwise show
+  // ARMED/require an extra flip before the display and loop() edge-detection resync.
+  lastToggle = digitalRead(TOGGLE_PIN);
   drawStatus(lastToggle==LOW); redrawArrowIconsNow(); drawSensorBlockFrame();
 }
 
